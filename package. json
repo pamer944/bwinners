@@ -1,14 +1,14 @@
 {
-  "name": "bwinners-account-manager",
+  "name": "bwinners-location-4",
   "version": "1.0.0",
-  "description": "BWINNERS account pool manager with 24-hour account locking",
+  "description": "BWINNERS Location 4 Account Pool Manager",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
   },
   "dependencies": {
-    "express": "^4.19.2",
-    "pg": "^8.11.3"
+    "express": "^4.21.2",
+    "pg": "^8.13.1"
   },
   "engines": {
     "node": ">=18.0.0"
