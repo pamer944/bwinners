@@ -5,7 +5,7 @@ const {
     claimFreeAccount, reLoginForTab, updateAccount,
     addAccount, removeAccount, resetAllAccounts, deleteAllAccounts,
     getBadPasswordAccounts, addBadPasswordAccount, removeBadPasswordAccount,
-    getZambiaTime,
+    getZambiaTime, ACCOUNT_LOCK_MS,
     REMOVE_PASSWORD, HEARTBEAT_TIMEOUT_MS, TIMEZONE
 } = require('./accounts');
 
@@ -27,7 +27,6 @@ function pad(n) {
 }
 
 const HEARTBEAT_SILENCE_TIMEOUT_MS = 3 * 60 * 60 * 1000;
-const TWENTY_FOUR_HOURS_MS = 24 * 60 * 60 * 1000;
 
 app.post('/add-account', async (req, res) => {
     try {
@@ -51,7 +50,7 @@ app.post('/add-account', async (req, res) => {
 });
 
 async function setupPool(name, base, store, alertsTable) {
-    // Accounts become available 24 hours after logout.
+    // Accounts become free again after the configured 24-hour lock.
 
     setInterval(async () => {
         try {
@@ -62,7 +61,7 @@ async function setupPool(name, base, store, alertsTable) {
                 if (
                     acc.status === 'IN-USE' &&
                     acc.logoutTime &&
-                    (now - acc.logoutTime >= TWENTY_FOUR_HOURS_MS)
+                    (now - acc.logoutTime >= ACCOUNT_LOCK_MS)
                 ) {
                     await store.updateAccount(acc.phone, {
                         status: 'FREE',
@@ -616,7 +615,7 @@ updateHB();
                 .filter(a => a.status === 'IN-USE' && a.logoutTime)
                 .map(a => ({
                     phone: a.phone,
-                    freeAt: a.logoutTime + TWENTY_FOUR_HOURS_MS,
+                    freeAt: a.logoutTime + ACCOUNT_LOCK_MS,
                     logoutTimeStr: a.logoutTimeStr
                 }))
                 .sort((a, b) => a.freeAt - b.freeAt);
