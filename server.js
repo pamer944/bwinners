@@ -1,3 +1,4 @@
+
 const express = require('express');
 const {
     pool, initDB, bwinners,
@@ -24,52 +25,6 @@ app.use((req, res, next) => {
 
 function pad(n) {
     return String(n).padStart(2, '0');
-}
-
-// Daily account-allocation window: OPEN 14:00-21:59 CAT.
-// LOCKED 22:00-13:59 CAT. This does not log out accounts already in use
-// and does not change the separate per-account 24-hour cooldown.
-function getAllocationStatus(now = new Date()) {
-    const parts = new Intl.DateTimeFormat('en-GB', {
-        timeZone: 'Africa/Lusaka',
-        year: 'numeric',
-        month: '2-digit',
-        day: '2-digit',
-        hour: '2-digit',
-        minute: '2-digit',
-        second: '2-digit',
-        hourCycle: 'h23'
-    }).formatToParts(now);
-
-    const value = {};
-    for (const part of parts) {
-        if (part.type !== 'literal') value[part.type] = Number(part.value);
-    }
-
-    const minutes = value.hour * 60 + value.minute;
-    const locked = minutes < 14 * 60 || minutes >= 22 * 60;
-    const targetHour = locked ? 14 : 22;
-
-    // Africa/Lusaka is CAT (UTC+2). Construct the next local transition.
-    let targetUtc = Date.UTC(
-        value.year,
-        value.month - 1,
-        value.day,
-        targetHour - 2,
-        0,
-        0
-    );
-
-    if (targetUtc <= now.getTime()) {
-        targetUtc += 24 * 60 * 60 * 1000;
-    }
-
-    return {
-        locked,
-        status: locked ? 'LOCKED' : 'OPEN',
-        nextTransitionAt: targetUtc,
-        nextTransitionLabel: locked ? '14:00 CAT' : '22:00 CAT'
-    };
 }
 
 const HEARTBEAT_SILENCE_TIMEOUT_MS = 3 * 60 * 60 * 1000;
@@ -181,28 +136,47 @@ async function setupPool(name, base, store, alertsTable) {
         }
     }, 60 * 1000);
 
+    // ==========================================
     // API ENDPOINTS
+    // ==========================================
 
     app.get(base + '/stats', async (req, res) => {
         try {
             const accounts = await store.getAccounts();
             const badPasswordAccounts = await store.getBadPasswordAccounts();
 
-            const allocation = getAllocationStatus();
-            const poolFree = accounts.filter(a => a.status === 'FREE').length;
-            const locked = allocation.locked ? poolFree : 0;
+            const readyCount = accounts.filter(
+                a => a.status === 'FREE'
+            ).length;
+
+            const lockedAccounts = accounts.filter(
+                a => a.status === 'IN-USE' && !!a.logoutTime
+            );
+
+            const nextUnlockAt = lockedAccounts.length
+                ? Math.min(
+                    ...lockedAccounts.map(
+                        a => Number(a.logoutTime) + ACCOUNT_LOCK_MS
+                    )
+                )
+                : null;
 
             res.json({
-                free: allocation.locked ? 0 : poolFree,
-                locked,
-                inUse: accounts.filter(a => a.status === 'IN-USE' && !a.logoutTime).length,
-                waiting: accounts.filter(a => a.status === 'IN-USE' && a.logoutTime).length,
+                // Dashboard total includes ready + locked accounts.
+                // Locked accounts cannot be assigned until their lock expires.
+                free: readyCount + lockedAccounts.length,
+                ready: readyCount,
+                locked: lockedAccounts.length,
+                nextUnlockAt,
+
+                inUse: accounts.filter(
+                    a => a.status === 'IN-USE' && !a.logoutTime
+                ).length,
+
+                waiting: lockedAccounts.length,
                 badPassword: badPasswordAccounts.length,
-                allocationLocked: allocation.locked,
-                allocationStatus: allocation.status,
-                allocationUnlockAt: allocation.locked ? allocation.nextTransitionAt : null,
-                allocationTransitionAt: allocation.nextTransitionAt,
-                allocationTransitionLabel: allocation.nextTransitionLabel
+                poolLocked: false,
+                reason: ''
             });
 
         } catch (e) {
@@ -240,7 +214,7 @@ async function setupPool(name, base, store, alertsTable) {
             const accounts = await store.getAccounts();
             const account = accounts.find(a => a.phone === phone);
 
-            if (account && account.status === 'IN-USE') {
+            if (account && account.status === 'IN-USE' && !account.logoutTime) {
                 await store.updateAccount(phone, {
                     lastHeartbeat: Date.now()
                 });
@@ -300,17 +274,6 @@ async function setupPool(name, base, store, alertsTable) {
                 });
             }
 
-            // Block new account allocations outside 14:00-21:59 CAT.
-            const allocation = getAllocationStatus();
-            if (allocation.locked) {
-                return res.json({
-                    success: false,
-                    locked: true,
-                    error: 'Account allocation is locked. It opens at 14:00 CAT.',
-                    unlockAt: allocation.nextTransitionAt
-                });
-            }
-
             const { hour, minute } = getZambiaTime();
 
             const claimed = await store.reLoginForTab(
@@ -334,6 +297,7 @@ async function setupPool(name, base, store, alertsTable) {
 
         } catch (e) {
             console.error('request-login error:', e);
+
             res.json({
                 success: false,
                 error: 'Server error'
@@ -377,6 +341,7 @@ async function setupPool(name, base, store, alertsTable) {
 
             const { hour, minute } = getZambiaTime();
             const accounts = await store.getAccounts();
+
             const acc = accounts.find(a => a.phone === phone) || {
                 phone,
                 password: 'unknown'
@@ -461,7 +426,8 @@ async function setupPool(name, base, store, alertsTable) {
             }
 
             await pool.query(
-                'INSERT INTO ' + alertsTable + ' (tab_id, amount, timestamp) VALUES ($1, $2, $3)',
+                'INSERT INTO ' + alertsTable +
+                ' (tab_id, amount, timestamp) VALUES ($1, $2, $3)',
                 [tabId, amount || 0, timestamp || Date.now()]
             );
 
@@ -527,6 +493,7 @@ async function setupPool(name, base, store, alertsTable) {
 
         } catch (e) {
             console.error('wipe-all-accounts error:', e);
+
             res.status(500).json({
                 success: false,
                 error: e.message
@@ -534,7 +501,10 @@ async function setupPool(name, base, store, alertsTable) {
         }
     });
 
-    // VIEW PAGES
+    // ==========================================
+    // FREE ACCOUNTS PAGE
+    // Locked accounts are intentionally excluded.
+    // ==========================================
 
     app.get(base + '/view/free', async (req, res) => {
         try {
@@ -549,26 +519,20 @@ async function setupPool(name, base, store, alertsTable) {
                     return 0;
                 });
 
-            const allocation = getAllocationStatus();
             const rows = list.map((r, i) =>
                 `<div class="row" data-phone="${r.phone}">
                     <div class="rn">${i + 1}.</div>
                     <div class="ri">
                         <div class="rp">${r.phone}</div>
                         <div class="rs">${r.password}</div>
-                        <div class="account-lock-state" style="font-size:11px;font-weight:700;margin-top:5px;color:${allocation.locked ? '#fbbf24' : '#3fb950'}">${allocation.locked ? 'LOCKED - opens at 14:00 CAT' : 'READY - allocation open'}</div>
                         <button class="rb" onclick="store.removeAccount('${r.phone}')">Remove</button>
                     </div>
                 </div>`
             ).join('') || '<div class="empty">No accounts</div>';
 
-            const subtitle = allocation.locked
-                ? list.length + ' accounts · LOCKED until 14:00 CAT'
-                : list.length + ' ready · allocation open';
-
             res.send(listPage(
                 'Free Accounts',
-                subtitle,
+                list.length + ' ready',
                 rows,
                 true,
                 base
@@ -578,6 +542,10 @@ async function setupPool(name, base, store, alertsTable) {
             res.status(500).send('Error');
         }
     });
+
+    // ==========================================
+    // IN-USE ACCOUNTS PAGE
+    // ==========================================
 
     app.get(base + '/view/inuse', async (req, res) => {
         try {
@@ -641,6 +609,7 @@ function filterRows(q) {
         r.classList.toggle('hidden', q !== '' && !r.dataset.phone.includes(q));
     });
 }
+
 function updateHB() {
     fetch('${base}/inuse-stats')
         .then(r => r.json())
@@ -648,25 +617,33 @@ function updateHB() {
             data.forEach((a, i) => {
                 const el = document.getElementById('hb-' + i);
                 if (!el) return;
+
                 if (!a.lastHeartbeat) {
                     el.className = 'rs warn';
-                    el.textContent = 'Waiting for heartbeat' + (a.tabId ? ' - ' + a.tabId : '');
+                    el.textContent = 'Waiting for heartbeat' +
+                        (a.tabId ? ' - ' + a.tabId : '');
                     return;
                 }
+
                 const s = Math.floor((Date.now() - a.lastHeartbeat) / 1000);
+
                 if (s < 5) {
                     el.className = 'rs alive';
-                    el.textContent = 'OK - ' + s + 's ago' + (a.tabId ? ' - ' + a.tabId : '');
+                    el.textContent = 'OK - ' + s + 's ago' +
+                        (a.tabId ? ' - ' + a.tabId : '');
                 } else if (s < 30) {
                     el.className = 'rs warn';
-                    el.textContent = 'Slow - ' + s + 's ago' + (a.tabId ? ' - ' + a.tabId : '');
+                    el.textContent = 'Slow - ' + s + 's ago' +
+                        (a.tabId ? ' - ' + a.tabId : '');
                 } else {
                     el.className = 'rs dead';
-                    el.textContent = 'No heartbeat - ' + s + 's ago' + (a.tabId ? ' - ' + a.tabId : '');
+                    el.textContent = 'No heartbeat - ' + s + 's ago' +
+                        (a.tabId ? ' - ' + a.tabId : '');
                 }
             });
         }).catch(() => {});
 }
+
 setInterval(updateHB, 1000);
 updateHB();
 </script>
@@ -677,6 +654,10 @@ updateHB();
             res.status(500).send('Error');
         }
     });
+
+    // ==========================================
+    // WAITING 24 HOURS PAGE
+    // ==========================================
 
     app.get(base + '/view/waiting', async (req, res) => {
         try {
@@ -692,7 +673,10 @@ updateHB();
                 .sort((a, b) => a.freeAt - b.freeAt);
 
             const freeAtData = JSON.stringify(
-                list.map((r, i) => ({ id: i, freeAt: r.freeAt }))
+                list.map((r, i) => ({
+                    id: i,
+                    freeAt: r.freeAt
+                }))
             );
 
             const rows = list.map((r, i) =>
@@ -701,7 +685,9 @@ updateHB();
                     <div class="ri">
                         <div class="rp">${r.phone}</div>
                         <div class="rs" id="cd-${i}">calculating...</div>
-                        ${r.logoutTimeStr ? `<div class="rn2">${r.logoutTimeStr}</div>` : ''}
+                        ${r.logoutTimeStr
+                            ? `<div class="rn2">${r.logoutTimeStr}</div>`
+                            : ''}
                     </div>
                 </div>`
             ).join('') || '<div class="empty">No accounts</div>';
@@ -741,14 +727,21 @@ body{font-family:sans-serif;background:#04060a;padding:20px;min-height:100vh}
 <div id="list">${rows}</div>
 </div>
 <script>
-function pad(n) { return String(n).padStart(2, '0'); }
+function pad(n) {
+    return String(n).padStart(2, '0');
+}
+
 const data = ${freeAtData};
+
 function updateCD() {
     const now = Date.now();
+
     data.forEach(item => {
         const el = document.getElementById('cd-' + item.id);
         if (!el) return;
+
         const diff = item.freeAt - now;
+
         if (diff <= 0) {
             el.textContent = 'Ready';
             el.style.color = '#3fb950';
@@ -756,15 +749,20 @@ function updateCD() {
             const h = Math.floor(diff / 3600000);
             const m = Math.floor((diff % 3600000) / 60000);
             const s = Math.floor((diff % 60000) / 1000);
-            el.textContent = 'Free in: ' + pad(h) + 'h ' + pad(m) + 'm ' + pad(s) + 's';
+
+            el.textContent =
+                'Free in: ' + pad(h) + 'h ' +
+                pad(m) + 'm ' + pad(s) + 's';
         }
     });
 }
+
 function filterRows(q) {
     document.querySelectorAll('.row').forEach(r => {
         r.classList.toggle('hidden', q !== '' && !r.dataset.phone.includes(q));
     });
 }
+
 setInterval(updateCD, 1000);
 updateCD();
 </script>
@@ -776,6 +774,10 @@ updateCD();
         }
     });
 
+    // ==========================================
+    // BAD PASSWORD PAGE
+    // ==========================================
+
     app.get(base + '/view/bad', async (req, res) => {
         try {
             const list = await store.getBadPasswordAccounts();
@@ -786,9 +788,11 @@ updateCD();
                     <div class="ri">
                         <div class="rp">${r.phone}</div>
                         <div class="rs">${r.password}</div>
-                        ${r.reportedAt ? `<div class="rt">Reported: ${r.reportedAt}</div>` : ''}
+                        ${r.reportedAt
+                            ? `<div class="rn2">${r.reportedAt}</div>`
+                            : ''}
+                        <button class="rb" onclick="store.removeAccount('${r.phone}')">Remove</button>
                     </div>
-                    <button class="rb" onclick="store.removeAccount('${r.phone}')">Remove</button>
                 </div>`
             ).join('') || '<div class="empty">No accounts</div>';
 
@@ -804,6 +808,10 @@ updateCD();
             res.status(500).send('Error');
         }
     });
+
+    // ==========================================
+    // REUSABLE LIST PAGE
+    // ==========================================
 
     function listPage(title, subtitle, rows, showRemove, basePath) {
         const removeEndpoint = title === 'Bad Password'
@@ -831,7 +839,7 @@ body{font-family:sans-serif;background:#04060a;padding:20px;min-height:100vh}
 .ri{flex:1}
 .rp{font-size:14px;color:#e6edf3;font-weight:500}
 .rs{font-size:11px;color:#4b5563;margin-top:2px}
-.rt{font-size:10px;color:#f87171;margin-top:2px}
+.rn2{font-size:10px;color:#4b5563;margin-top:2px}
 .rb{background:#2d0a0a;border:1px solid #7f1d1d;color:#f87171;padding:4px 10px;border-radius:6px;font-size:11px;cursor:pointer}
 .empty{padding:40px;text-align:center;color:#4b5563;font-size:13px}
 .hidden{display:none}
@@ -875,26 +883,34 @@ let removing = false;
 window.store = {
     removeAccount: function(phone) {
         pending = phone;
+
         const modal = document.getElementById('modal');
         const pin = document.getElementById('pin');
         const error = document.getElementById('perr');
+
         if (!modal || !pin || !error) return;
+
         pin.value = '';
         error.style.display = 'none';
         modal.style.display = 'flex';
-        setTimeout(function() { pin.focus(); }, 50);
+
+        setTimeout(function() {
+            pin.focus();
+        }, 50);
     }
 };
 
 function closeModal() {
     pending = null;
     removing = false;
+
     document.getElementById('modal').style.display = 'none';
     document.getElementById('pin').value = '';
 }
 
 async function confirmRemove() {
     if (removing || !pending) return;
+
     const pin = document.getElementById('pin').value.trim();
     const error = document.getElementById('perr');
     const button = document.getElementById('remove-confirm');
@@ -902,8 +918,10 @@ async function confirmRemove() {
     if (pin !== '1234') {
         error.textContent = 'Incorrect password';
         error.style.display = 'block';
+
         document.getElementById('pin').value = '';
         document.getElementById('pin').focus();
+
         return;
     }
 
@@ -914,7 +932,10 @@ async function confirmRemove() {
         const response = await fetch('${basePath}/${removeEndpoint}', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ phone: pending, pin: pin })
+            body: JSON.stringify({
+                phone: pending,
+                pin: pin
+            })
         });
 
         const result = await response.json();
@@ -922,11 +943,15 @@ async function confirmRemove() {
         if (result.success) {
             const row = Array.from(document.querySelectorAll('.row'))
                 .find(r => r.dataset.phone === pending);
+
             if (row) row.remove();
+
             closeModal();
+
         } else {
             error.textContent = result.error || 'Removal failed';
             error.style.display = 'block';
+
             removing = false;
             button.textContent = 'Remove';
         }
@@ -934,6 +959,7 @@ async function confirmRemove() {
     } catch (e) {
         error.textContent = 'Connection error. Try again.';
         error.style.display = 'block';
+
         removing = false;
         button.textContent = 'Remove';
     }
@@ -941,6 +967,7 @@ async function confirmRemove() {
 
 document.addEventListener('DOMContentLoaded', function() {
     const pin = document.getElementById('pin');
+
     if (pin) {
         pin.addEventListener('keydown', function(e) {
             if (e.key === 'Enter') confirmRemove();
@@ -959,11 +986,14 @@ function filterRows(q) {
 </html>`;
     }
 
+    // ==========================================
     // MAIN BWINNERS DASHBOARD
+    // ==========================================
 
     app.get(base || '/', async (req, res) => {
         try {
             const accounts = await store.getAccounts();
+
             const freeAccounts = accounts.filter(a => a.status === 'FREE');
             const inUseAccounts = accounts.filter(a => a.status === 'IN-USE' && !a.logoutTime);
             const waitingAccounts = accounts.filter(a => a.status === 'IN-USE' && a.logoutTime);
@@ -1040,29 +1070,27 @@ body{font-family:sans-serif;background:#04060a;min-height:100vh;display:flex;ali
 
 <div class="boxes">
     <div class="box box-free">
-        <div class="bl c-free">&#10003; Free</div>
-        <div class="bn c-free" id="num-free">${freeAccounts.length}</div>
-        <div class="bd d-free">Accounts ready</div>
-        <div id="locked-count" style="font-size:11px;color:#fbbf24;margin:-5px 0 10px;">Locked: 0</div>
-        <a href="${base}/view/free" class="vbtn">View <span class="vcnt" id="cnt-free">${freeAccounts.length}</span></a>
+        <div class="bl c-free">&#10003; Total accounts</div>
+        <div class="bn c-free" id="num-free">${freeAccounts.length + waitingAccounts.length}</div>
+        <div class="bd d-free">Ready + locked accounts</div>
+        <div id="locked-summary" style="margin:0 0 8px;font-size:12px;color:#fbbf24;">&#128274; Locked: ${waitingAccounts.length}</div>
+        <div id="next-unlock" style="font-size:11px;color:#c4b5fd;margin-bottom:12px;">Unlocks in: --</div>
+        <a href="${base}/view/free" class="vbtn">View Free <span class="vcnt" id="cnt-free">${freeAccounts.length}</span></a>
     </div>
+
     <div class="box box-inuse">
         <div class="bl c-inuse">&#9654; In use</div>
         <div class="bn c-inuse" id="num-inuse">${inUseAccounts.length}</div>
         <div class="bd d-inuse">Not yet logged out</div>
         <a href="${base}/view/inuse" class="vbtn">View <span class="vcnt" id="cnt-inuse">${inUseAccounts.length}</span></a>
     </div>
+
     <div class="box box-waiting">
         <div class="bl c-waiting">&#9203; Waiting 24 hours</div>
         <div class="bn c-waiting" id="num-waiting">${waitingAccounts.length}</div>
         <div class="bd d-waiting">Until account becomes free</div>
         <a href="${base}/view/waiting" class="vbtn">View <span class="vcnt" id="cnt-waiting">${waitingAccounts.length}</span></a>
     </div>
-</div>
-
-<div id="allocation-banner" style="background:#101820;border:1px solid #334155;border-radius:10px;padding:12px 14px;margin:-2px 0 16px;color:#cbd5e1;font-size:12px;">
-    <div id="allocation-status" style="font-weight:800;">Checking allocation schedule...</div>
-    <div id="allocation-countdown" style="margin-top:5px;color:#fbbf24;"></div>
 </div>
 
 <div class="add-box">
@@ -1111,7 +1139,9 @@ body{font-family:sans-serif;background:#04060a;min-height:100vh;display:flex;ali
 
 <script>
 (function() {
-    function pad(n) { return String(n).padStart(2, '0'); }
+    function pad(n) {
+        return String(n).padStart(2, '0');
+    }
 
     function zambiaTime() {
         return new Date().toLocaleTimeString('en-GB', {
@@ -1123,10 +1153,16 @@ body{font-family:sans-serif;background:#04060a;min-height:100vh;display:flex;ali
     }
 
     setInterval(function() {
-        document.getElementById('tick').textContent = zambiaTime() + ' CAT';
+        document.getElementById('tick').textContent =
+            zambiaTime() + ' CAT';
     }, 1000);
 
-    document.getElementById('tick').textContent = zambiaTime() + ' CAT';
+    document.getElementById('tick').textContent =
+        zambiaTime() + ' CAT';
+
+    // ==========================================
+    // LIVE DASHBOARD STATS
+    // ==========================================
 
     function refreshStats() {
         fetch('${base}/stats')
@@ -1135,64 +1171,66 @@ body{font-family:sans-serif;background:#04060a;min-height:100vh;display:flex;ali
                 document.getElementById('num-free').textContent = d.free;
                 document.getElementById('num-inuse').textContent = d.inUse;
                 document.getElementById('num-waiting').textContent = d.waiting;
-                document.getElementById('cnt-free').textContent = d.free;
+
+                // Free Accounts page shows only accounts ready to use.
+                document.getElementById('cnt-free').textContent = d.ready;
                 document.getElementById('cnt-inuse').textContent = d.inUse;
                 document.getElementById('cnt-waiting').textContent = d.waiting;
 
-                var lockedCount = document.getElementById('locked-count');
-                var scheduleStatus = document.getElementById('allocation-status');
-                var countdown = document.getElementById('allocation-countdown');
-                var banner = document.getElementById('allocation-banner');
+                var lockedSummary =
+                    document.getElementById('locked-summary');
 
-                if (lockedCount) lockedCount.textContent = 'Locked: ' + (d.locked || 0);
+                var nextUnlock =
+                    document.getElementById('next-unlock');
 
-                if (d.allocationLocked) {
-                    if (scheduleStatus) {
-                        scheduleStatus.textContent = 'ACCOUNT ALLOCATION LOCKED';
-                        scheduleStatus.style.color = '#fbbf24';
-                    }
-                    if (banner) {
-                        banner.style.borderColor = '#92400e';
-                        banner.style.background = '#21180b';
-                    }
-                    if (countdown) {
-                        countdown.style.display = 'block';
-                        var remaining = Math.max(0, Number(d.allocationUnlockAt) - Date.now());
-                        var hh = Math.floor(remaining / 3600000);
-                        var mm = Math.floor((remaining % 3600000) / 60000);
-                        var ss = Math.floor((remaining % 60000) / 1000);
-                        countdown.textContent = 'Unlocks at 14:00 CAT · ' +
-                            String(hh).padStart(2, '0') + ':' +
-                            String(mm).padStart(2, '0') + ':' +
-                            String(ss).padStart(2, '0');
-                    }
-                } else {
-                    if (scheduleStatus) {
-                        scheduleStatus.textContent = 'ACCOUNT ALLOCATION OPEN';
-                        scheduleStatus.style.color = '#3fb950';
-                    }
-                    if (banner) {
-                        banner.style.borderColor = '#166534';
-                        banner.style.background = '#0b1d12';
-                    }
-                    if (countdown) {
-                        countdown.style.display = 'none';
-                        countdown.textContent = '';
+                if (lockedSummary) {
+                    lockedSummary.textContent =
+                        '🔒 Locked: ' + d.locked;
+                }
+
+                if (nextUnlock) {
+                    if (d.nextUnlockAt) {
+                        var diff = Math.max(
+                            0,
+                            d.nextUnlockAt - Date.now()
+                        );
+
+                        var h = Math.floor(diff / 3600000);
+                        var m = Math.floor((diff % 3600000) / 60000);
+                        var sec = Math.floor((diff % 60000) / 1000);
+
+                        nextUnlock.textContent =
+                            'Next unlock in: ' +
+                            h + 'h ' +
+                            pad(m) + 'm ' +
+                            pad(sec) + 's';
+                    } else {
+                        nextUnlock.textContent = 'Unlocks in: --';
                     }
                 }
             })
-            .catch(() => {});
+            .catch(err => {
+                console.error('Dashboard stats refresh failed:', err);
+            });
     }
 
     setInterval(refreshStats, 2000);
     refreshStats();
 
+    // ==========================================
+    // ADD ACCOUNT
+    // ==========================================
+
     function showMsg(text, ok) {
         var el = document.getElementById('add-msg');
+
         el.textContent = text;
         el.className = 'msg ' + (ok ? 'msg-ok' : 'msg-err');
         el.style.display = 'block';
-        setTimeout(function() { el.style.display = 'none'; }, 3000);
+
+        setTimeout(function() {
+            el.style.display = 'none';
+        }, 3000);
     }
 
     document.getElementById('add-btn').addEventListener('click', function() {
@@ -1204,24 +1242,44 @@ body{font-family:sans-serif;background:#04060a;min-height:100vh;display:flex;ali
             return;
         }
 
+        var addButton = document.getElementById('add-btn');
+        addButton.disabled = true;
+        addButton.textContent = 'Adding...';
+
         fetch('${base}/add-account', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ phone: phone, password: password })
+            body: JSON.stringify({
+                phone: phone,
+                password: password
+            })
         })
         .then(r => r.json())
         .then(d => {
             if (d.success) {
                 showMsg('Account added successfully', true);
+
                 document.getElementById('inp-phone').value = '';
                 document.getElementById('inp-pass').value = '';
+
+                // Refresh immediately, including while allocation is locked.
                 refreshStats();
             } else {
                 showMsg(d.error || 'Could not add account', false);
             }
         })
-        .catch(() => showMsg('Connection error', false));
+        .catch(() => {
+            showMsg('Connection error', false);
+        })
+        .finally(() => {
+            addButton.disabled = false;
+            addButton.textContent = 'Add';
+        });
     });
+
+    // ==========================================
+    // ALERTS PANEL
+    // ==========================================
 
     var viewBtn = document.getElementById('view-btn');
     var hideBtn = document.getElementById('hide-btn');
@@ -1239,17 +1297,20 @@ body{font-family:sans-serif;background:#04060a;min-height:100vh;display:flex;ali
 
     clearBtn.addEventListener('click', function() {
         var pin = prompt('Enter password to clear alerts:');
+
         if (pin !== '1234') {
             alert('Incorrect password');
             return;
         }
 
-        fetch('${base}/clear-alerts', { method: 'POST' })
-            .then(() => {
-                renderAlerts([]);
-                alert('Alerts cleared!');
-            })
-            .catch(() => alert('Error'));
+        fetch('${base}/clear-alerts', {
+            method: 'POST'
+        })
+        .then(() => {
+            renderAlerts([]);
+            alert('Alerts cleared!');
+        })
+        .catch(() => alert('Error'));
     });
 
     function loadAlerts() {
@@ -1263,29 +1324,44 @@ body{font-family:sans-serif;background:#04060a;min-height:100vh;display:flex;ali
         var container = document.getElementById('acontainer');
 
         if (!items || !items.length) {
-            container.innerHTML = '<div class="aempty">No low balance accounts yet...</div>';
+            container.innerHTML =
+                '<div class="aempty">No low balance accounts yet...</div>';
             return;
         }
 
         var groups = {};
+
         items.forEach(function(item) {
             var id = item.tabId || 'Unknown';
+
             if (!groups[id]) groups[id] = [];
+
             groups[id].push(item);
         });
 
         var html = '';
+
         Object.keys(groups).forEach(function(id) {
             var group = groups[id];
+
             html += '<div class="abox">';
-            html += '<div class="abox-header"><div class="abox-title">' + id + '</div>';
-            html += '<div class="abox-count">' + group.length + '</div></div>';
+            html += '<div class="abox-header">';
+            html += '<div class="abox-title">' + id + '</div>';
+            html += '<div class="abox-count">' + group.length + '</div>';
+            html += '</div>';
             html += '<div class="abox-body">';
 
             group.forEach(function(item, i) {
-                html += '<div class="arow"><div class="anum">' + (i + 1) + '.</div>';
-                html += '<div class="achips"><div class="achip"><div class="achip-ph">' +
-                    String(item.amount || '') + '</div></div></div></div>';
+                html += '<div class="arow">';
+                html += '<div class="anum">' + (i + 1) + '.</div>';
+                html += '<div class="achips">';
+                html += '<div class="achip">';
+                html += '<div class="achip-ph">' +
+                    String(item.amount || '') +
+                    '</div>';
+                html += '</div>';
+                html += '</div>';
+                html += '</div>';
             });
 
             html += '</div></div>';
@@ -1295,7 +1371,9 @@ body{font-family:sans-serif;background:#04060a;min-height:100vh;display:flex;ali
     }
 
     setInterval(function() {
-        if (panel.style.display === 'block') loadAlerts();
+        if (panel.style.display === 'block') {
+            loadAlerts();
+        }
     }, 5000);
 
 })();
@@ -1314,7 +1392,10 @@ initDB().then(async function() {
     await setupPool('BWINNERS', '', bwinners, 'alerts');
 
     app.listen(PORT, () => {
-        console.log('BWINNERS active on port ' + PORT + ' -- Location 4 -- Africa/Lusaka');
+        console.log(
+            'BWINNERS active on port ' + PORT +
+            ' -- Location 4 -- Africa/Lusaka'
+        );
     });
 
 }).catch(function(err) {
