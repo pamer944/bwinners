@@ -26,6 +26,12 @@ function pad(n) {
     return String(n).padStart(2, '0');
 }
 
+// FREE accounts are unavailable from 22:00 until 14:00 Zambia time.
+function isFreeAccountLockTime() {
+    const { hour } = getZambiaTime();
+    return hour >= 22 || hour < 14;
+}
+
 const HEARTBEAT_SILENCE_TIMEOUT_MS = 3 * 60 * 60 * 1000;
 
 app.post('/add-account', async (req, res) => {
@@ -50,8 +56,34 @@ app.post('/add-account', async (req, res) => {
 });
 
 async function setupPool(name, base, store, alertsTable) {
-    // Accounts become free again after the configured 24-hour lock.
+    // Lock only FREE accounts from 22:00 until 14:00 (Africa/Lusaka).
+    // IN-USE accounts and the existing post-logout waiting period are unchanged.
+    async function updateFreeAccountLockSchedule() {
+        try {
+            const accounts = await store.getAccounts();
+            const shouldLock = isFreeAccountLockTime();
+            const now = Date.now();
 
+            for (const acc of accounts) {
+                if (shouldLock && acc.status === 'FREE') {
+                    await store.updateAccount(acc.phone, { status: 'LOCKED' });
+                } else if (!shouldLock && acc.status === 'LOCKED') {
+                    await store.updateAccount(acc.phone, {
+                        status: 'FREE',
+                        freedAt: now
+                    });
+                }
+            }
+        } catch (e) {
+            console.error('free-account schedule error:', e);
+        }
+    }
+
+    // Apply the correct state on startup, then recheck every 10 seconds.
+    await updateFreeAccountLockSchedule();
+    setInterval(updateFreeAccountLockSchedule, 10 * 1000);
+
+    // Accounts become free again after the configured 24-hour waiting period.
     setInterval(async () => {
         try {
             const accounts = await store.getAccounts();
@@ -147,8 +179,11 @@ async function setupPool(name, base, store, alertsTable) {
                 inUse: accounts.filter(a => a.status === 'IN-USE' && !a.logoutTime).length,
                 waiting: accounts.filter(a => a.status === 'IN-USE' && a.logoutTime).length,
                 badPassword: badPasswordAccounts.length,
-                locked: false,
-                reason: ''
+                locked: isFreeAccountLockTime(),
+                lockedAccounts: accounts.filter(a => a.status === 'LOCKED').length,
+                reason: isFreeAccountLockTime()
+                    ? 'Free accounts locked until 14:00 Zambia time.'
+                    : ''
             });
 
         } catch (e) {
@@ -243,6 +278,14 @@ async function setupPool(name, base, store, alertsTable) {
                 return res.json({
                     success: false,
                     error: 'Tab ID required.'
+                });
+            }
+
+            // Do not allow any free account to be claimed during locked hours.
+            if (isFreeAccountLockTime()) {
+                return res.json({
+                    success: false,
+                    error: 'Free accounts are locked until 14:00 Zambia time.'
                 });
             }
 
