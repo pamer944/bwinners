@@ -26,6 +26,52 @@ function pad(n) {
     return String(n).padStart(2, '0');
 }
 
+// Daily account-allocation window: OPEN 14:00-21:59 CAT.
+// LOCKED 22:00-13:59 CAT. This does not log out accounts already in use
+// and does not change the separate per-account 24-hour cooldown.
+function getAllocationStatus(now = new Date()) {
+    const parts = new Intl.DateTimeFormat('en-GB', {
+        timeZone: 'Africa/Lusaka',
+        year: 'numeric',
+        month: '2-digit',
+        day: '2-digit',
+        hour: '2-digit',
+        minute: '2-digit',
+        second: '2-digit',
+        hourCycle: 'h23'
+    }).formatToParts(now);
+
+    const value = {};
+    for (const part of parts) {
+        if (part.type !== 'literal') value[part.type] = Number(part.value);
+    }
+
+    const minutes = value.hour * 60 + value.minute;
+    const locked = minutes < 14 * 60 || minutes >= 22 * 60;
+    const targetHour = locked ? 14 : 22;
+
+    // Africa/Lusaka is CAT (UTC+2). Construct the next local transition.
+    let targetUtc = Date.UTC(
+        value.year,
+        value.month - 1,
+        value.day,
+        targetHour - 2,
+        0,
+        0
+    );
+
+    if (targetUtc <= now.getTime()) {
+        targetUtc += 24 * 60 * 60 * 1000;
+    }
+
+    return {
+        locked,
+        status: locked ? 'LOCKED' : 'OPEN',
+        nextTransitionAt: targetUtc,
+        nextTransitionLabel: locked ? '14:00 CAT' : '22:00 CAT'
+    };
+}
+
 const HEARTBEAT_SILENCE_TIMEOUT_MS = 3 * 60 * 60 * 1000;
 
 app.post('/add-account', async (req, res) => {
@@ -142,13 +188,21 @@ async function setupPool(name, base, store, alertsTable) {
             const accounts = await store.getAccounts();
             const badPasswordAccounts = await store.getBadPasswordAccounts();
 
+            const allocation = getAllocationStatus();
+            const poolFree = accounts.filter(a => a.status === 'FREE').length;
+            const locked = allocation.locked ? poolFree : 0;
+
             res.json({
-                free: accounts.filter(a => a.status === 'FREE').length,
+                free: allocation.locked ? 0 : poolFree,
+                locked,
                 inUse: accounts.filter(a => a.status === 'IN-USE' && !a.logoutTime).length,
                 waiting: accounts.filter(a => a.status === 'IN-USE' && a.logoutTime).length,
                 badPassword: badPasswordAccounts.length,
-                locked: false,
-                reason: ''
+                allocationLocked: allocation.locked,
+                allocationStatus: allocation.status,
+                allocationUnlockAt: allocation.locked ? allocation.nextTransitionAt : null,
+                allocationTransitionAt: allocation.nextTransitionAt,
+                allocationTransitionLabel: allocation.nextTransitionLabel
             });
 
         } catch (e) {
@@ -243,6 +297,17 @@ async function setupPool(name, base, store, alertsTable) {
                 return res.json({
                     success: false,
                     error: 'Tab ID required.'
+                });
+            }
+
+            // Block new account allocations outside 14:00-21:59 CAT.
+            const allocation = getAllocationStatus();
+            if (allocation.locked) {
+                return res.json({
+                    success: false,
+                    locked: true,
+                    error: 'Account allocation is locked. It opens at 14:00 CAT.',
+                    unlockAt: allocation.nextTransitionAt
                 });
             }
 
@@ -484,20 +549,26 @@ async function setupPool(name, base, store, alertsTable) {
                     return 0;
                 });
 
+            const allocation = getAllocationStatus();
             const rows = list.map((r, i) =>
                 `<div class="row" data-phone="${r.phone}">
                     <div class="rn">${i + 1}.</div>
                     <div class="ri">
                         <div class="rp">${r.phone}</div>
                         <div class="rs">${r.password}</div>
+                        <div class="account-lock-state" style="font-size:11px;font-weight:700;margin-top:5px;color:${allocation.locked ? '#fbbf24' : '#3fb950'}">${allocation.locked ? 'LOCKED - opens at 14:00 CAT' : 'READY - allocation open'}</div>
                         <button class="rb" onclick="store.removeAccount('${r.phone}')">Remove</button>
                     </div>
                 </div>`
             ).join('') || '<div class="empty">No accounts</div>';
 
+            const subtitle = allocation.locked
+                ? list.length + ' accounts · LOCKED until 14:00 CAT'
+                : list.length + ' ready · allocation open';
+
             res.send(listPage(
                 'Free Accounts',
-                list.length + ' ready',
+                subtitle,
                 rows,
                 true,
                 base
@@ -972,6 +1043,7 @@ body{font-family:sans-serif;background:#04060a;min-height:100vh;display:flex;ali
         <div class="bl c-free">&#10003; Free</div>
         <div class="bn c-free" id="num-free">${freeAccounts.length}</div>
         <div class="bd d-free">Accounts ready</div>
+        <div id="locked-count" style="font-size:11px;color:#fbbf24;margin:-5px 0 10px;">Locked: 0</div>
         <a href="${base}/view/free" class="vbtn">View <span class="vcnt" id="cnt-free">${freeAccounts.length}</span></a>
     </div>
     <div class="box box-inuse">
@@ -986,6 +1058,11 @@ body{font-family:sans-serif;background:#04060a;min-height:100vh;display:flex;ali
         <div class="bd d-waiting">Until account becomes free</div>
         <a href="${base}/view/waiting" class="vbtn">View <span class="vcnt" id="cnt-waiting">${waitingAccounts.length}</span></a>
     </div>
+</div>
+
+<div id="allocation-banner" style="background:#101820;border:1px solid #334155;border-radius:10px;padding:12px 14px;margin:-2px 0 16px;color:#cbd5e1;font-size:12px;">
+    <div id="allocation-status" style="font-weight:800;">Checking allocation schedule...</div>
+    <div id="allocation-countdown" style="margin-top:5px;color:#fbbf24;"></div>
 </div>
 
 <div class="add-box">
@@ -1061,6 +1138,48 @@ body{font-family:sans-serif;background:#04060a;min-height:100vh;display:flex;ali
                 document.getElementById('cnt-free').textContent = d.free;
                 document.getElementById('cnt-inuse').textContent = d.inUse;
                 document.getElementById('cnt-waiting').textContent = d.waiting;
+
+                var lockedCount = document.getElementById('locked-count');
+                var scheduleStatus = document.getElementById('allocation-status');
+                var countdown = document.getElementById('allocation-countdown');
+                var banner = document.getElementById('allocation-banner');
+
+                if (lockedCount) lockedCount.textContent = 'Locked: ' + (d.locked || 0);
+
+                if (d.allocationLocked) {
+                    if (scheduleStatus) {
+                        scheduleStatus.textContent = 'ACCOUNT ALLOCATION LOCKED';
+                        scheduleStatus.style.color = '#fbbf24';
+                    }
+                    if (banner) {
+                        banner.style.borderColor = '#92400e';
+                        banner.style.background = '#21180b';
+                    }
+                    if (countdown) {
+                        countdown.style.display = 'block';
+                        var remaining = Math.max(0, Number(d.allocationUnlockAt) - Date.now());
+                        var hh = Math.floor(remaining / 3600000);
+                        var mm = Math.floor((remaining % 3600000) / 60000);
+                        var ss = Math.floor((remaining % 60000) / 1000);
+                        countdown.textContent = 'Unlocks at 14:00 CAT · ' +
+                            String(hh).padStart(2, '0') + ':' +
+                            String(mm).padStart(2, '0') + ':' +
+                            String(ss).padStart(2, '0');
+                    }
+                } else {
+                    if (scheduleStatus) {
+                        scheduleStatus.textContent = 'ACCOUNT ALLOCATION OPEN';
+                        scheduleStatus.style.color = '#3fb950';
+                    }
+                    if (banner) {
+                        banner.style.borderColor = '#166534';
+                        banner.style.background = '#0b1d12';
+                    }
+                    if (countdown) {
+                        countdown.style.display = 'none';
+                        countdown.textContent = '';
+                    }
+                }
             })
             .catch(() => {});
     }
