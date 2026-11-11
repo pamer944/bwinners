@@ -16,10 +16,10 @@ const PORT = process.env.PORT || 3000;
 app.use(express.json());
 
 app.use((req, res, next) => {
-    res.header("Access-Control-Allow-Origin", "*");
-    res.header("Access-Control-Allow-Headers", "Origin, X-Requested-With, Content-Type, Accept");
-    res.header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-    if (req.method === "OPTIONS") return res.sendStatus(200);
+    res.header('Access-Control-Allow-Origin', '*');
+    res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept');
+    res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+    if (req.method === 'OPTIONS') return res.sendStatus(200);
     next();
 });
 
@@ -29,29 +29,49 @@ function pad(n) {
 
 const HEARTBEAT_SILENCE_TIMEOUT_MS = 3 * 60 * 60 * 1000;
 
+// ==========================================
+// ADD ACCOUNT
+// ==========================================
+
 app.post('/add-account', async (req, res) => {
     try {
         const { phone, password } = req.body || {};
 
         if (!phone || !password) {
-            return res.json({ success: false, error: 'Phone and password required.' });
+            return res.json({
+                success: false,
+                error: 'Phone and password required.'
+            });
         }
 
-        const existing = (await bwinners.getAccounts()).some(a => a.phone === phone);
+        const existing = (await bwinners.getAccounts())
+            .some(a => a.phone === phone);
+
         if (existing) {
-            return res.json({ success: false, error: 'Account already exists.' });
+            return res.json({
+                success: false,
+                error: 'Account already exists.'
+            });
         }
 
         await bwinners.addAccount(phone, password);
-        res.json({ success: true });
 
+        res.json({ success: true });
     } catch (e) {
-        res.status(500).json({ success: false, error: e.message });
+        res.status(500).json({
+            success: false,
+            error: e.message
+        });
     }
 });
 
+// ==========================================
+// POOL SETUP
+// ==========================================
+
 async function setupPool(name, base, store, alertsTable) {
-    // Accounts become free again after the configured 24-hour lock.
+
+    // Release accounts when their 24-hour lock expires.
 
     setInterval(async () => {
         try {
@@ -62,7 +82,7 @@ async function setupPool(name, base, store, alertsTable) {
                 if (
                     acc.status === 'IN-USE' &&
                     acc.logoutTime &&
-                    (now - acc.logoutTime >= ACCOUNT_LOCK_MS)
+                    now - acc.logoutTime >= ACCOUNT_LOCK_MS
                 ) {
                     await store.updateAccount(acc.phone, {
                         status: 'FREE',
@@ -79,6 +99,8 @@ async function setupPool(name, base, store, alertsTable) {
             console.error('auto-free error:', e);
         }
     }, 60 * 1000);
+
+    // Heartbeat timeout.
 
     setInterval(async () => {
         try {
@@ -109,6 +131,8 @@ async function setupPool(name, base, store, alertsTable) {
         }
     }, 10 * 1000);
 
+    // Three-hour heartbeat silence timeout.
+
     setInterval(async () => {
         try {
             const accounts = await store.getAccounts();
@@ -137,7 +161,7 @@ async function setupPool(name, base, store, alertsTable) {
     }, 60 * 1000);
 
     // ==========================================
-    // API ENDPOINTS
+    // DASHBOARD STATS
     // ==========================================
 
     app.get(base + '/stats', async (req, res) => {
@@ -145,44 +169,45 @@ async function setupPool(name, base, store, alertsTable) {
             const accounts = await store.getAccounts();
             const badPasswordAccounts = await store.getBadPasswordAccounts();
 
-            const readyCount = accounts.filter(
+            const readyAccounts = accounts.filter(
                 a => a.status === 'FREE'
-            ).length;
+            );
 
             const lockedAccounts = accounts.filter(
                 a => a.status === 'IN-USE' && !!a.logoutTime
             );
 
             const nextUnlockAt = lockedAccounts.length
-                ? Math.min(
-                    ...lockedAccounts.map(
-                        a => Number(a.logoutTime) + ACCOUNT_LOCK_MS
-                    )
-                )
+                ? Math.min(...lockedAccounts.map(
+                    a => Number(a.logoutTime) + ACCOUNT_LOCK_MS
+                ))
                 : null;
 
             res.json({
-                // Dashboard total includes ready + locked accounts.
-                // Locked accounts cannot be assigned until their lock expires.
-                free: readyCount + lockedAccounts.length,
-                ready: readyCount,
-                locked: lockedAccounts.length,
-                nextUnlockAt,
+                // Only genuinely FREE accounts are counted here.
+                free: readyAccounts.length,
+                ready: readyAccounts.length,
 
                 inUse: accounts.filter(
                     a => a.status === 'IN-USE' && !a.logoutTime
                 ).length,
 
                 waiting: lockedAccounts.length,
+                locked: lockedAccounts.length,
+                nextUnlockAt,
+
                 badPassword: badPasswordAccounts.length,
                 poolLocked: false,
                 reason: ''
             });
-
         } catch (e) {
             res.status(500).json({ error: e.message });
         }
     });
+
+    // ==========================================
+    // IN-USE STATS
+    // ==========================================
 
     app.get(base + '/inuse-stats', async (req, res) => {
         try {
@@ -191,9 +216,15 @@ async function setupPool(name, base, store, alertsTable) {
             const list = accounts
                 .filter(a => a.status === 'IN-USE' && !a.logoutTime)
                 .sort((a, b) => {
-                    const aNum = a.tabId ? parseInt(a.tabId.replace('TAB-', '')) : 9999;
-                    const bNum = b.tabId ? parseInt(b.tabId.replace('TAB-', '')) : 9999;
-                    return aNum - bNum;
+                    const an = a.tabId
+                        ? parseInt(a.tabId.replace('TAB-', ''))
+                        : 9999;
+
+                    const bn = b.tabId
+                        ? parseInt(b.tabId.replace('TAB-', ''))
+                        : 9999;
+
+                    return an - bn;
                 })
                 .map(a => ({
                     phone: a.phone,
@@ -202,11 +233,14 @@ async function setupPool(name, base, store, alertsTable) {
                 }));
 
             res.json(list);
-
         } catch (e) {
             res.status(500).json([]);
         }
     });
+
+    // ==========================================
+    // HEARTBEAT
+    // ==========================================
 
     app.post(base + '/heartbeat', async (req, res) => {
         try {
@@ -214,7 +248,11 @@ async function setupPool(name, base, store, alertsTable) {
             const accounts = await store.getAccounts();
             const account = accounts.find(a => a.phone === phone);
 
-            if (account && account.status === 'IN-USE' && !account.logoutTime) {
+            if (
+                account &&
+                account.status === 'IN-USE' &&
+                !account.logoutTime
+            ) {
                 await store.updateAccount(phone, {
                     lastHeartbeat: Date.now()
                 });
@@ -226,11 +264,14 @@ async function setupPool(name, base, store, alertsTable) {
                 success: false,
                 error: 'Account not found or not in use.'
             });
-
         } catch (e) {
             res.status(500).json({ success: false });
         }
     });
+
+    // ==========================================
+    // TAB CLOSED
+    // ==========================================
 
     app.post(base + '/tab-closed', express.text({ type: '*/*' }), async (req, res) => {
         try {
@@ -247,7 +288,11 @@ async function setupPool(name, base, store, alertsTable) {
             const accounts = await store.getAccounts();
             const account = accounts.find(a => a.phone === phone);
 
-            if (account && account.status === 'IN-USE' && !account.logoutTime) {
+            if (
+                account &&
+                account.status === 'IN-USE' &&
+                !account.logoutTime
+            ) {
                 const { hour, minute } = getZambiaTime();
 
                 await store.updateAccount(phone, {
@@ -257,11 +302,14 @@ async function setupPool(name, base, store, alertsTable) {
             }
 
             res.json({ success: true });
-
         } catch (e) {
             res.json({ success: false });
         }
     });
+
+    // ==========================================
+    // REQUEST LOGIN
+    // ==========================================
 
     app.post(base + '/request-login', async (req, res) => {
         try {
@@ -290,11 +338,10 @@ async function setupPool(name, base, store, alertsTable) {
                 });
             }
 
-            return res.json({
+            res.json({
                 success: false,
                 error: 'No free accounts available'
             });
-
         } catch (e) {
             console.error('request-login error:', e);
 
@@ -304,6 +351,10 @@ async function setupPool(name, base, store, alertsTable) {
             });
         }
     });
+
+    // ==========================================
+    // LOGOUT
+    // ==========================================
 
     app.post(base + '/logout', async (req, res) => {
         try {
@@ -327,11 +378,14 @@ async function setupPool(name, base, store, alertsTable) {
                 success: false,
                 error: 'Account not found.'
             });
-
         } catch (e) {
             res.status(500).json({ success: false });
         }
     });
+
+    // ==========================================
+    // WRONG PASSWORD
+    // ==========================================
 
     app.post(base + '/wrong-password', async (req, res) => {
         try {
@@ -356,11 +410,14 @@ async function setupPool(name, base, store, alertsTable) {
             );
 
             res.json({ success: true });
-
         } catch (e) {
             res.status(500).json({ success: false });
         }
     });
+
+    // ==========================================
+    // REMOVE ACCOUNT
+    // ==========================================
 
     app.post(base + '/remove-account', async (req, res) => {
         try {
@@ -382,7 +439,6 @@ async function setupPool(name, base, store, alertsTable) {
 
             await store.removeAccount(phone);
             res.json({ success: true });
-
         } catch (e) {
             res.status(500).json({ success: false });
         }
@@ -408,11 +464,14 @@ async function setupPool(name, base, store, alertsTable) {
 
             await store.removeBadPasswordAccount(phone);
             res.json({ success: true });
-
         } catch (e) {
             res.status(500).json({ success: false });
         }
     });
+
+    // ==========================================
+    // CASHOUT ALERTS
+    // ==========================================
 
     app.post(base + '/cashout', async (req, res) => {
         try {
@@ -433,7 +492,6 @@ async function setupPool(name, base, store, alertsTable) {
 
             console.log('[ALERT] Recorded:', tabId);
             res.json({ ok: true });
-
         } catch (e) {
             console.error('cashout error:', e);
             res.status(500).json({ ok: false });
@@ -444,7 +502,6 @@ async function setupPool(name, base, store, alertsTable) {
         try {
             await pool.query('DELETE FROM ' + alertsTable);
             res.json({ ok: true });
-
         } catch (e) {
             res.status(500).json({ ok: false });
         }
@@ -461,17 +518,19 @@ async function setupPool(name, base, store, alertsTable) {
                 amount: parseFloat(r.amount),
                 timestamp: parseInt(r.timestamp)
             })));
-
         } catch (e) {
             res.status(500).json([]);
         }
     });
 
+    // ==========================================
+    // RESET / WIPE
+    // ==========================================
+
     app.post(base + '/reset', async (req, res) => {
         try {
             await store.resetAllAccounts();
             res.json({ success: true });
-
         } catch (e) {
             res.status(500).json({ success: false });
         }
@@ -490,7 +549,6 @@ async function setupPool(name, base, store, alertsTable) {
 
             await store.deleteAllAccounts();
             res.json({ success: true });
-
         } catch (e) {
             console.error('wipe-all-accounts error:', e);
 
@@ -503,7 +561,7 @@ async function setupPool(name, base, store, alertsTable) {
 
     // ==========================================
     // FREE ACCOUNTS PAGE
-    // Locked accounts are intentionally excluded.
+    // IMPORTANT: locked accounts are excluded.
     // ==========================================
 
     app.get(base + '/view/free', async (req, res) => {
@@ -513,7 +571,9 @@ async function setupPool(name, base, store, alertsTable) {
             const list = accounts
                 .filter(a => a.status === 'FREE')
                 .sort((a, b) => {
-                    if (a.freedAt && b.freedAt) return a.freedAt - b.freedAt;
+                    if (a.freedAt && b.freedAt) {
+                        return a.freedAt - b.freedAt;
+                    }
                     if (a.freedAt) return -1;
                     if (b.freedAt) return 1;
                     return 0;
@@ -532,13 +592,13 @@ async function setupPool(name, base, store, alertsTable) {
 
             res.send(listPage(
                 'Free Accounts',
-                list.length + ' ready',
+                list.length + ' accounts',
                 rows,
                 true,
                 base
             ));
-
         } catch (e) {
+            console.error('Free accounts page error:', e);
             res.status(500).send('Error');
         }
     });
@@ -554,8 +614,14 @@ async function setupPool(name, base, store, alertsTable) {
             const list = accounts
                 .filter(a => a.status === 'IN-USE' && !a.logoutTime)
                 .sort((a, b) => {
-                    const an = a.tabId ? parseInt(a.tabId.replace('TAB-', '')) : 9999;
-                    const bn = b.tabId ? parseInt(b.tabId.replace('TAB-', '')) : 9999;
+                    const an = a.tabId
+                        ? parseInt(a.tabId.replace('TAB-', ''))
+                        : 9999;
+
+                    const bn = b.tabId
+                        ? parseInt(b.tabId.replace('TAB-', ''))
+                        : 9999;
+
                     return an - bn;
                 });
 
@@ -649,7 +715,6 @@ updateHB();
 </script>
 </body>
 </html>`);
-
         } catch (e) {
             res.status(500).send('Error');
         }
@@ -667,7 +732,7 @@ updateHB();
                 .filter(a => a.status === 'IN-USE' && a.logoutTime)
                 .map(a => ({
                     phone: a.phone,
-                    freeAt: a.logoutTime + ACCOUNT_LOCK_MS,
+                    freeAt: Number(a.logoutTime) + ACCOUNT_LOCK_MS,
                     logoutTimeStr: a.logoutTimeStr
                 }))
                 .sort((a, b) => a.freeAt - b.freeAt);
@@ -768,7 +833,6 @@ updateCD();
 </script>
 </body>
 </html>`);
-
         } catch (e) {
             res.status(500).send('Error');
         }
@@ -789,10 +853,10 @@ updateCD();
                         <div class="rp">${r.phone}</div>
                         <div class="rs">${r.password}</div>
                         ${r.reportedAt
-                            ? `<div class="rn2">${r.reportedAt}</div>`
+                            ? `<div class="rt">Reported: ${r.reportedAt}</div>`
                             : ''}
-                        <button class="rb" onclick="store.removeAccount('${r.phone}')">Remove</button>
                     </div>
+                    <button class="rb" onclick="store.removeAccount('${r.phone}')">Remove</button>
                 </div>`
             ).join('') || '<div class="empty">No accounts</div>';
 
@@ -803,7 +867,6 @@ updateCD();
                 true,
                 base
             ));
-
         } catch (e) {
             res.status(500).send('Error');
         }
@@ -839,11 +902,11 @@ body{font-family:sans-serif;background:#04060a;padding:20px;min-height:100vh}
 .ri{flex:1}
 .rp{font-size:14px;color:#e6edf3;font-weight:500}
 .rs{font-size:11px;color:#4b5563;margin-top:2px}
-.rn2{font-size:10px;color:#4b5563;margin-top:2px}
+.rt{font-size:10px;color:#f87171;margin-top:2px}
 .rb{background:#2d0a0a;border:1px solid #7f1d1d;color:#f87171;padding:4px 10px;border-radius:6px;font-size:11px;cursor:pointer}
 .empty{padding:40px;text-align:center;color:#4b5563;font-size:13px}
 .hidden{display:none}
-.pm{position:fixed;inset:0;background:rgba(0,0,0,0.85);display:flex;align-items:center;justify-content:center;padding:20px;z-index:100}
+.pm{position:fixed;inset:0;background:rgba(0,0,0,.85);display:flex;align-items:center;justify-content:center;padding:20px;z-index:100}
 .pb{background:#0d1117;border:1.5px solid #21262d;border-radius:16px;padding:28px 24px;width:100%;max-width:320px;text-align:center}
 .ptt{font-size:15px;font-weight:500;color:#e6edf3;margin-bottom:6px}
 .ps2{font-size:12px;color:#4b5563;margin-bottom:20px}
@@ -921,7 +984,6 @@ async function confirmRemove() {
 
         document.getElementById('pin').value = '';
         document.getElementById('pin').focus();
-
         return;
     }
 
@@ -945,21 +1007,16 @@ async function confirmRemove() {
                 .find(r => r.dataset.phone === pending);
 
             if (row) row.remove();
-
             closeModal();
-
         } else {
             error.textContent = result.error || 'Removal failed';
             error.style.display = 'block';
-
             removing = false;
             button.textContent = 'Remove';
         }
-
     } catch (e) {
         error.textContent = 'Connection error. Try again.';
         error.style.display = 'block';
-
         removing = false;
         button.textContent = 'Remove';
     }
@@ -978,7 +1035,10 @@ document.addEventListener('DOMContentLoaded', function() {
 
 function filterRows(q) {
     document.querySelectorAll('.row').forEach(r => {
-        r.classList.toggle('hidden', q !== '' && !r.dataset.phone.includes(q));
+        r.classList.toggle(
+            'hidden',
+            q !== '' && !r.dataset.phone.includes(q)
+        );
     });
 }
 </script>
@@ -987,24 +1047,30 @@ function filterRows(q) {
     }
 
     // ==========================================
-    // MAIN BWINNERS DASHBOARD
+    // MAIN DASHBOARD
     // ==========================================
 
     app.get(base || '/', async (req, res) => {
         try {
             const accounts = await store.getAccounts();
 
-            const freeAccounts = accounts.filter(a => a.status === 'FREE');
-            const inUseAccounts = accounts.filter(a => a.status === 'IN-USE' && !a.logoutTime);
-            const waitingAccounts = accounts.filter(a => a.status === 'IN-USE' && a.logoutTime);
-            const badPasswordAccounts = await store.getBadPasswordAccounts();
+            const freeAccounts = accounts.filter(
+                a => a.status === 'FREE'
+            );
+
+            const inUseAccounts = accounts.filter(
+                a => a.status === 'IN-USE' && !a.logoutTime
+            );
+
+            const waitingAccounts = accounts.filter(
+                a => a.status === 'IN-USE' && !!a.logoutTime
+            );
 
             res.send(`<!DOCTYPE html>
 <html>
 <head>
 <title>BWINNERS - Account Dashboard</title>
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
 body{font-family:sans-serif;background:#04060a;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px}
@@ -1014,7 +1080,7 @@ body{font-family:sans-serif;background:#04060a;min-height:100vh;display:flex;ali
 .pill{padding:6px 14px;border-radius:20px;font-size:11px;font-weight:600;display:flex;align-items:center;gap:6px}
 .pill-live{background:#0d4429;color:#3fb950}
 .dot{width:7px;height:7px;border-radius:50%;animation:blink 1.2s infinite;background:#3fb950}
-@keyframes blink{0%,100%{opacity:1}50%{opacity:0.15}}
+@keyframes blink{0%,100%{opacity:1}50%{opacity:.15}}
 .boxes{display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;margin-bottom:16px}
 .box{border-radius:14px;padding:16px 14px;display:flex;flex-direction:column}
 .box-free{background:#0a1a0f;border:1.5px solid #1a4a27}
@@ -1028,11 +1094,12 @@ body{font-family:sans-serif;background:#04060a;min-height:100vh;display:flex;ali
 .vbtn{width:100%;border-radius:8px;font-size:11px;font-weight:600;cursor:pointer;display:flex;align-items:center;justify-content:center;gap:6px;padding:9px;border:none;background:#92400e;color:#fed7aa;text-decoration:none}
 .vcnt{background:#fed7aa;color:#92400e;border-radius:20px;padding:1px 7px;font-size:10px;font-weight:700}
 .add-box{background:#0d1117;border:1.5px solid #21262d;border-radius:12px;padding:18px 20px;margin-bottom:16px}
-.add-title{font-size:12px;font-weight:600;color:#8b949e;margin-bottom:12px;letter-spacing:0.5px;text-transform:uppercase}
+.add-title{font-size:12px;font-weight:600;color:#8b949e;margin-bottom:12px;letter-spacing:.5px;text-transform:uppercase}
 .add-row{display:flex;gap:8px;flex-wrap:wrap}
 .add-input{flex:1;min-width:110px;background:#161b22;border:1px solid #30363d;color:#e6edf3;padding:10px 12px;border-radius:8px;font-size:13px;outline:none}
 .add-input::placeholder{color:#4b5563}
 .add-btn{background:#1a3a6e;border:none;color:#a8d0ff;padding:10px 16px;border-radius:8px;font-size:13px;font-weight:500;cursor:pointer}
+.add-btn:disabled{opacity:.6}
 .msg{font-size:12px;margin-top:8px;padding:7px 10px;border-radius:6px;display:none}
 .msg-ok{background:#0d4429;color:#3fb950}.msg-err{background:#4b1111;color:#f87171}
 .alerts-area{margin-bottom:16px}
@@ -1045,18 +1112,16 @@ body{font-family:sans-serif;background:#04060a;min-height:100vh;display:flex;ali
 .abox-header{background:#0d1117;border-radius:12px 12px 0 0;padding:10px 14px;display:flex;justify-content:space-between;align-items:center}
 .abox-title{font-size:11px;font-weight:800;color:#f1f5f9;letter-spacing:2px}
 .abox-count{font-size:10px;font-weight:700;background:#1e293b;color:#94a3b8;padding:3px 8px;border-radius:20px}
-.abox-count.full{background:#ef4444;color:#fff}
 .abox-body{background:#161b22;border-radius:0 0 12px 12px;overflow:hidden}
 .arow{display:flex;align-items:center;padding:9px 12px;border-bottom:1px solid #1a1a2e;gap:8px}
 .arow:last-child{border-bottom:none}
 .achips{display:flex;gap:8px;flex:1}
 .achip{background:#0d1117;border-radius:7px;padding:7px 12px}
-.achip-id{font-size:13px;font-weight:800;color:#e6edf3}
 .achip-ph{font-size:11px;font-weight:600;color:#e6edf3;font-family:monospace}
 .anum{font-size:11px;font-weight:800;color:#4b5563;min-width:20px;text-align:right}
 .aempty{padding:20px;text-align:center;color:#4b5563;font-size:13px}
 .footer{display:flex;justify-content:space-between;align-items:center;margin-top:14px}
-.tick{font-size:11px;color:#3fb950;font-family:monospace;opacity:0.7}
+.tick{font-size:11px;color:#3fb950;font-family:monospace;opacity:.7}
 .hint{font-size:10px;color:#252b35}
 @media(max-width:600px){.boxes{gap:8px}.box{padding:14px 10px}.bn{font-size:32px}}
 </style>
@@ -1065,36 +1130,46 @@ body{font-family:sans-serif;background:#04060a;min-height:100vh;display:flex;ali
 <div class="db">
 <div class="top-bar">
     <div class="db-title">&#127918; BWINNERS - Location 4</div>
-    <div id="pill" class="pill pill-live"><div class="dot"></div><span id="pill-text">Live</span></div>
+    <div class="pill pill-live"><div class="dot"></div><span>Live</span></div>
 </div>
 
 <div class="boxes">
     <div class="box box-free">
-        <div class="bl c-free">&#10003; Total accounts</div>
-        <div class="bn c-free" id="num-free">${freeAccounts.length + waitingAccounts.length}</div>
-        <div class="bd d-free">Ready + locked accounts</div>
-        <div id="locked-summary" style="margin:0 0 8px;font-size:12px;color:#fbbf24;">&#128274; Locked: ${waitingAccounts.length}</div>
-        <div id="next-unlock" style="font-size:11px;color:#c4b5fd;margin-bottom:12px;">Unlocks in: --</div>
-        <a href="${base}/view/free" class="vbtn">View Free <span class="vcnt" id="cnt-free">${freeAccounts.length}</span></a>
+        <div class="bl c-free">&#10003; Free Accounts</div>
+        <div class="bn c-free" id="num-free">${freeAccounts.length}</div>
+        <div class="bd d-free">Ready to use</div>
+        <div id="locked-summary" style="margin:0 0 8px;font-size:12px;color:#fbbf24;">
+            &#128274; Locked: ${waitingAccounts.length}
+        </div>
+        <div id="next-unlock" style="font-size:11px;color:#c4b5fd;margin-bottom:12px;">
+            Unlocks in: --
+        </div>
+        <a href="${base}/view/free" class="vbtn">
+            View Free <span class="vcnt" id="cnt-free">${freeAccounts.length}</span>
+        </a>
     </div>
 
     <div class="box box-inuse">
-        <div class="bl c-inuse">&#9654; In use</div>
+        <div class="bl c-inuse">&#9654; In Use</div>
         <div class="bn c-inuse" id="num-inuse">${inUseAccounts.length}</div>
         <div class="bd d-inuse">Not yet logged out</div>
-        <a href="${base}/view/inuse" class="vbtn">View <span class="vcnt" id="cnt-inuse">${inUseAccounts.length}</span></a>
+        <a href="${base}/view/inuse" class="vbtn">
+            View <span class="vcnt" id="cnt-inuse">${inUseAccounts.length}</span>
+        </a>
     </div>
 
     <div class="box box-waiting">
-        <div class="bl c-waiting">&#9203; Waiting 24 hours</div>
+        <div class="bl c-waiting">&#9203; Waiting 24 Hours</div>
         <div class="bn c-waiting" id="num-waiting">${waitingAccounts.length}</div>
         <div class="bd d-waiting">Until account becomes free</div>
-        <a href="${base}/view/waiting" class="vbtn">View <span class="vcnt" id="cnt-waiting">${waitingAccounts.length}</span></a>
+        <a href="${base}/view/waiting" class="vbtn">
+            View <span class="vcnt" id="cnt-waiting">${waitingAccounts.length}</span>
+        </a>
     </div>
 </div>
 
 <div class="add-box">
-    <div class="add-title">&#43; Add BWINNERS account</div>
+    <div class="add-title">&#43; Add BWINNERS Account</div>
     <div class="add-row">
         <input class="add-input" id="inp-phone" placeholder="Phone number" type="text">
         <input class="add-input" id="inp-pass" placeholder="Password" type="text">
@@ -1120,23 +1195,6 @@ body{font-family:sans-serif;background:#04060a;min-height:100vh;display:flex;ali
 </div>
 </div>
 
-<div id="note-printable" style="position:fixed;left:-9999px;top:0;width:400px;background:#fff;padding:32px 28px;font-family:sans-serif;">
-    <div id="note-title" style="font-size:16px;font-weight:900;color:#0f172a;margin-bottom:4px;"></div>
-    <div id="note-date" style="font-size:11px;color:#94a3b8;margin-bottom:20px;"></div>
-    <hr style="border:none;border-top:2px solid #e2e8f0;margin-bottom:16px;">
-    <div id="note-rows"></div>
-    <div style="margin-top:20px;font-size:10px;color:#cbd5e1;text-align:center;">BWINNERS - Location 4</div>
-</div>
-
-<style>
-.note-row{display:flex;align-items:baseline;gap:10px;padding:7px 0;border-bottom:1px solid #f1f5f9;font-size:13px;color:#0f172a}
-.note-row:last-child{border-bottom:none}
-.note-num{font-size:11px;font-weight:700;color:#94a3b8;min-width:22px;text-align:right}
-.note-id{font-weight:800}
-.note-sep{color:#cbd5e1}
-.note-phone{font-family:monospace;font-size:12px;color:#334155}
-</style>
-
 <script>
 (function() {
     function pad(n) {
@@ -1152,65 +1210,53 @@ body{font-family:sans-serif;background:#04060a;min-height:100vh;display:flex;ali
         });
     }
 
-    setInterval(function() {
+    function updateClock() {
         document.getElementById('tick').textContent =
             zambiaTime() + ' CAT';
-    }, 1000);
+    }
 
-    document.getElementById('tick').textContent =
-        zambiaTime() + ' CAT';
+    setInterval(updateClock, 1000);
+    updateClock();
 
     // ==========================================
-    // LIVE DASHBOARD STATS
+    // LIVE DASHBOARD COUNTS
     // ==========================================
 
     function refreshStats() {
         fetch('${base}/stats')
             .then(r => r.json())
             .then(d => {
+                // This number is only the actual FREE account count.
                 document.getElementById('num-free').textContent = d.free;
-                document.getElementById('num-inuse').textContent = d.inUse;
-                document.getElementById('num-waiting').textContent = d.waiting;
+                document.getElementById('cnt-free').textContent = d.free;
 
-                // Free Accounts page shows only accounts ready to use.
-                document.getElementById('cnt-free').textContent = d.ready;
+                document.getElementById('num-inuse').textContent = d.inUse;
                 document.getElementById('cnt-inuse').textContent = d.inUse;
+
+                document.getElementById('num-waiting').textContent = d.waiting;
                 document.getElementById('cnt-waiting').textContent = d.waiting;
 
-                var lockedSummary =
-                    document.getElementById('locked-summary');
+                document.getElementById('locked-summary').textContent =
+                    '🔒 Locked: ' + d.locked;
 
-                var nextUnlock =
-                    document.getElementById('next-unlock');
+                const nextUnlock = document.getElementById('next-unlock');
 
-                if (lockedSummary) {
-                    lockedSummary.textContent =
-                        '🔒 Locked: ' + d.locked;
-                }
+                if (d.nextUnlockAt) {
+                    const diff = Math.max(0, d.nextUnlockAt - Date.now());
 
-                if (nextUnlock) {
-                    if (d.nextUnlockAt) {
-                        var diff = Math.max(
-                            0,
-                            d.nextUnlockAt - Date.now()
-                        );
+                    const h = Math.floor(diff / 3600000);
+                    const m = Math.floor((diff % 3600000) / 60000);
+                    const s = Math.floor((diff % 60000) / 1000);
 
-                        var h = Math.floor(diff / 3600000);
-                        var m = Math.floor((diff % 3600000) / 60000);
-                        var sec = Math.floor((diff % 60000) / 1000);
-
-                        nextUnlock.textContent =
-                            'Next unlock in: ' +
-                            h + 'h ' +
-                            pad(m) + 'm ' +
-                            pad(sec) + 's';
-                    } else {
-                        nextUnlock.textContent = 'Unlocks in: --';
-                    }
+                    nextUnlock.textContent =
+                        'Next unlock in: ' +
+                        h + 'h ' + pad(m) + 'm ' + pad(s) + 's';
+                } else {
+                    nextUnlock.textContent = 'Unlocks in: --';
                 }
             })
             .catch(err => {
-                console.error('Dashboard stats refresh failed:', err);
+                console.error('Stats refresh failed:', err);
             });
     }
 
@@ -1221,38 +1267,35 @@ body{font-family:sans-serif;background:#04060a;min-height:100vh;display:flex;ali
     // ADD ACCOUNT
     // ==========================================
 
-    function showMsg(text, ok) {
-        var el = document.getElementById('add-msg');
+    function showMsg(message, success) {
+        const el = document.getElementById('add-msg');
 
-        el.textContent = text;
-        el.className = 'msg ' + (ok ? 'msg-ok' : 'msg-err');
+        el.textContent = message;
+        el.className = 'msg ' + (success ? 'msg-ok' : 'msg-err');
         el.style.display = 'block';
 
-        setTimeout(function() {
+        setTimeout(() => {
             el.style.display = 'none';
         }, 3000);
     }
 
     document.getElementById('add-btn').addEventListener('click', function() {
-        var phone = document.getElementById('inp-phone').value.trim();
-        var password = document.getElementById('inp-pass').value.trim();
+        const phone = document.getElementById('inp-phone').value.trim();
+        const password = document.getElementById('inp-pass').value.trim();
+        const button = document.getElementById('add-btn');
 
         if (!phone || !password) {
             showMsg('Phone and password required', false);
             return;
         }
 
-        var addButton = document.getElementById('add-btn');
-        addButton.disabled = true;
-        addButton.textContent = 'Adding...';
+        button.disabled = true;
+        button.textContent = 'Adding...';
 
         fetch('${base}/add-account', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                phone: phone,
-                password: password
-            })
+            body: JSON.stringify({ phone, password })
         })
         .then(r => r.json())
         .then(d => {
@@ -1262,7 +1305,7 @@ body{font-family:sans-serif;background:#04060a;min-height:100vh;display:flex;ali
                 document.getElementById('inp-phone').value = '';
                 document.getElementById('inp-pass').value = '';
 
-                // Refresh immediately, including while allocation is locked.
+                // Immediately refresh, even when other accounts are locked.
                 refreshStats();
             } else {
                 showMsg(d.error || 'Could not add account', false);
@@ -1272,8 +1315,8 @@ body{font-family:sans-serif;background:#04060a;min-height:100vh;display:flex;ali
             showMsg('Connection error', false);
         })
         .finally(() => {
-            addButton.disabled = false;
-            addButton.textContent = 'Add';
+            button.disabled = false;
+            button.textContent = 'Add';
         });
     });
 
@@ -1281,10 +1324,10 @@ body{font-family:sans-serif;background:#04060a;min-height:100vh;display:flex;ali
     // ALERTS PANEL
     // ==========================================
 
-    var viewBtn = document.getElementById('view-btn');
-    var hideBtn = document.getElementById('hide-btn');
-    var clearBtn = document.getElementById('clear-btn');
-    var panel = document.getElementById('apanel');
+    const viewBtn = document.getElementById('view-btn');
+    const hideBtn = document.getElementById('hide-btn');
+    const clearBtn = document.getElementById('clear-btn');
+    const panel = document.getElementById('apanel');
 
     viewBtn.addEventListener('click', function() {
         panel.style.display = 'block';
@@ -1296,21 +1339,19 @@ body{font-family:sans-serif;background:#04060a;min-height:100vh;display:flex;ali
     });
 
     clearBtn.addEventListener('click', function() {
-        var pin = prompt('Enter password to clear alerts:');
+        const pin = prompt('Enter password to clear alerts:');
 
         if (pin !== '1234') {
             alert('Incorrect password');
             return;
         }
 
-        fetch('${base}/clear-alerts', {
-            method: 'POST'
-        })
-        .then(() => {
-            renderAlerts([]);
-            alert('Alerts cleared!');
-        })
-        .catch(() => alert('Error'));
+        fetch('${base}/clear-alerts', { method: 'POST' })
+            .then(() => {
+                renderAlerts([]);
+                alert('Alerts cleared!');
+            })
+            .catch(() => alert('Error'));
     });
 
     function loadAlerts() {
@@ -1321,7 +1362,7 @@ body{font-family:sans-serif;background:#04060a;min-height:100vh;display:flex;ali
     }
 
     function renderAlerts(items) {
-        var container = document.getElementById('acontainer');
+        const container = document.getElementById('acontainer');
 
         if (!items || !items.length) {
             container.innerHTML =
@@ -1329,20 +1370,18 @@ body{font-family:sans-serif;background:#04060a;min-height:100vh;display:flex;ali
             return;
         }
 
-        var groups = {};
+        const groups = {};
 
-        items.forEach(function(item) {
-            var id = item.tabId || 'Unknown';
-
+        items.forEach(item => {
+            const id = item.tabId || 'Unknown';
             if (!groups[id]) groups[id] = [];
-
             groups[id].push(item);
         });
 
-        var html = '';
+        let html = '';
 
-        Object.keys(groups).forEach(function(id) {
-            var group = groups[id];
+        Object.keys(groups).forEach(id => {
+            const group = groups[id];
 
             html += '<div class="abox">';
             html += '<div class="abox-header">';
@@ -1351,17 +1390,14 @@ body{font-family:sans-serif;background:#04060a;min-height:100vh;display:flex;ali
             html += '</div>';
             html += '<div class="abox-body">';
 
-            group.forEach(function(item, i) {
+            group.forEach((item, i) => {
                 html += '<div class="arow">';
                 html += '<div class="anum">' + (i + 1) + '.</div>';
                 html += '<div class="achips">';
                 html += '<div class="achip">';
                 html += '<div class="achip-ph">' +
                     String(item.amount || '') +
-                    '</div>';
-                html += '</div>';
-                html += '</div>';
-                html += '</div>';
+                    '</div></div></div></div>';
             });
 
             html += '</div></div>';
@@ -1371,22 +1407,23 @@ body{font-family:sans-serif;background:#04060a;min-height:100vh;display:flex;ali
     }
 
     setInterval(function() {
-        if (panel.style.display === 'block') {
-            loadAlerts();
-        }
+        if (panel.style.display === 'block') loadAlerts();
     }, 5000);
 
 })();
 </script>
 </body>
 </html>`);
-
         } catch (e) {
             console.error('dashboard error:', e);
             res.status(500).send('Error: ' + e.message);
         }
     });
 }
+
+// ==========================================
+// START SERVER
+// ==========================================
 
 initDB().then(async function() {
     await setupPool('BWINNERS', '', bwinners, 'alerts');
@@ -1397,7 +1434,6 @@ initDB().then(async function() {
             ' -- Location 4 -- Africa/Lusaka'
         );
     });
-
 }).catch(function(err) {
     console.error('Failed to initialize BWINNERS database:', err);
     process.exit(1);
