@@ -305,7 +305,8 @@ function makeStore(T, B) {
             status: 'status',
             inUseSince: 'in_use_since',
             tabId: 'tab_id',
-            freedAt: 'freed_at'
+            freedAt: 'freed_at',
+            password: 'password'
         };
 
         const keys = Object.keys(fields);
