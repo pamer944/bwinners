@@ -1,4 +1,3 @@
-
 const express = require('express');
 const {
     pool, initDB, bwinners,
@@ -34,6 +33,8 @@ const POOL_LOCK_START_MINUTES = 22 * 60;
 const POOL_UNLOCK_MINUTES = 14 * 60;
 let poolLocked = false;
 let poolLockedReason = '';
+let manualLock = false;   // force locked regardless of schedule
+let forceOpen = false;    // force open, overriding tonight's schedule lock
 let lastDailySweepDate = '';
 
 function isPoolTimeLocked(hour, minute) {
@@ -47,10 +48,17 @@ function getZambiaDateKey() {
 
 function updatePoolLockState() {
     const { hour, minute } = getZambiaTime();
-    poolLocked = isPoolTimeLocked(hour, minute);
+    const timeLocked = isPoolTimeLocked(hour, minute);
+
+    // A manual unlock (forceOpen) clears itself once the schedule is naturally open.
+    if (!timeLocked && forceOpen) forceOpen = false;
+
+    poolLocked = manualLock || (timeLocked && !forceOpen);
     poolLockedReason = poolLocked
-        ? 'Locked from 22:00. Unlocks at 14:00 Zambia time.'
-        : 'Pool is live until 22:00 Zambia time.';
+        ? (manualLock
+            ? 'Locked manually.'
+            : 'Locked from 22:00. Unlocks at 14:00 Zambia time.')
+        : 'Pool is live.';
     return { hour, minute, locked: poolLocked, reason: poolLockedReason };
 }
 
@@ -209,6 +217,7 @@ async function setupPool(name, base, store, alertsTable) {
                 badPassword: badPasswordAccounts.length,
                 locked: poolLocked,
                 poolLocked,
+                manualLock,
                 reason: poolLockedReason,
                 zambiaTime: (() => {
                     const t = getZambiaTime();
@@ -457,6 +466,70 @@ async function setupPool(name, base, store, alertsTable) {
         }
     });
 
+    app.post(base + '/toggle-lock', async (req, res) => {
+        try {
+            const { pin, lock } = req.body || {};
+
+            if (pin !== REMOVE_PASSWORD) {
+                return res.json({ success: false, error: 'Incorrect PIN.' });
+            }
+
+            const { hour, minute } = getZambiaTime();
+            const timeLocked = isPoolTimeLocked(hour, minute);
+            const wantLock = typeof lock === 'boolean' ? lock : !poolLocked;
+
+            if (wantLock) {
+                manualLock = true;
+                forceOpen = false;
+            } else {
+                manualLock = false;
+                forceOpen = timeLocked; // override tonight's schedule lock
+            }
+
+            updatePoolLockState();
+
+            res.json({ success: true, locked: poolLocked, reason: poolLockedReason, manualLock });
+
+        } catch (e) {
+            res.status(500).json({ success: false, error: e.message });
+        }
+    });
+
+    app.post(base + '/change-all-passwords', async (req, res) => {
+        try {
+            const { pin, newPassword, oldPassword } = req.body || {};
+
+            if (pin !== REMOVE_PASSWORD) {
+                return res.json({ success: false, error: 'Incorrect PIN.' });
+            }
+
+            const newPass = (newPassword || '').trim();
+            const oldPass = (oldPassword || '').trim();
+
+            if (!newPass) {
+                return res.json({ success: false, error: 'New password required.' });
+            }
+
+            const accounts = await store.getAccounts();
+            const targets = oldPass
+                ? accounts.filter(a => a.password === oldPass)
+                : accounts;
+
+            let updated = 0;
+            for (const acc of targets) {
+                if (acc.password === newPass) continue;
+                await store.updateAccount(acc.phone, { password: newPass });
+                updated++;
+            }
+
+            res.json({ success: true, updated });
+
+        } catch (e) {
+            console.error('change-all-passwords error:', e);
+            res.status(500).json({ success: false, error: e.message });
+        }
+    });
+
     app.post(base + '/cashout', async (req, res) => {
         try {
             const { tabId, amount, timestamp } = req.body;
@@ -512,6 +585,8 @@ async function setupPool(name, base, store, alertsTable) {
     app.post(base + '/reset', async (req, res) => {
         try {
             await store.resetAllAccounts();
+            manualLock = false;
+            forceOpen = false;
             updatePoolLockState();
             res.json({ success: true, locked: poolLocked, reason: poolLockedReason });
 
@@ -988,6 +1063,8 @@ body{font-family:sans-serif;background:#04060a;min-height:100vh;display:flex;ali
 .pill-live{background:#0d4429;color:#3fb950}
 .pill-locked{background:#4b1111;color:#f87171}
 .pill-locked .dot{background:#f87171}
+.lock-btn{background:#161b22;border:1px solid #30363d;color:#e6edf3;padding:6px 12px;border-radius:20px;font-size:11px;font-weight:600;cursor:pointer}
+.lock-btn.on{background:#4b1111;border-color:#7f1d1d;color:#f87171}
 .dot{width:7px;height:7px;border-radius:50%;animation:blink 1.2s infinite;background:#3fb950}
 @keyframes blink{0%,100%{opacity:1}50%{opacity:0.15}}
 .boxes{display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;margin-bottom:16px}
@@ -1040,7 +1117,10 @@ body{font-family:sans-serif;background:#04060a;min-height:100vh;display:flex;ali
 <div class="db">
 <div class="top-bar">
     <div class="db-title">&#127918; BWINNERS - Location 4</div>
-    <div id="pill" class="pill ${poolLocked ? 'pill-locked' : 'pill-live'}"><div class="dot"></div><span id="pill-text">${poolLocked ? 'Locked' : 'Live'}</span></div>
+    <div style="display:flex;align-items:center;gap:8px">
+        <button id="lock-btn" class="lock-btn ${poolLocked ? 'on' : ''}">${poolLocked ? '&#128275; Unlock' : '&#128274; Lock'}</button>
+        <div id="pill" class="pill ${poolLocked ? 'pill-locked' : 'pill-live'}"><div class="dot"></div><span id="pill-text">${poolLocked ? 'Locked' : 'Live'}</span></div>
+    </div>
 </div>
 <div id="pool-schedule" style="font-size:11px;color:#8b949e;margin:-5px 0 14px 2px;">Pool schedule: Locked 22:00 - Unlock 14:00 (Zambia time)</div>
 
@@ -1073,6 +1153,17 @@ body{font-family:sans-serif;background:#04060a;min-height:100vh;display:flex;ali
         <button class="add-btn" id="add-btn">Add</button>
     </div>
     <div class="msg" id="add-msg"></div>
+</div>
+
+<div class="add-box">
+    <div class="add-title">&#128273; Change all passwords</div>
+    <div class="add-row">
+        <input class="add-input" id="cp-old" placeholder="Current password (blank = all)" type="text">
+        <input class="add-input" id="cp-new" placeholder="New password" type="text">
+        <input class="add-input" id="cp-pin" placeholder="PIN" type="password" autocomplete="off" style="max-width:110px">
+        <button class="add-btn" id="cp-btn">Change</button>
+    </div>
+    <div class="msg" id="cp-msg"></div>
 </div>
 
 <div class="alerts-area">
@@ -1145,6 +1236,11 @@ body{font-family:sans-serif;background:#04060a;min-height:100vh;display:flex;ali
                     pill.className = 'pill ' + (d.locked ? 'pill-locked' : 'pill-live');
                     pillText.textContent = d.locked ? 'Locked' : 'Live';
                 }
+                var lockBtn = document.getElementById('lock-btn');
+                if (lockBtn) {
+                    lockBtn.className = 'lock-btn' + (d.locked ? ' on' : '');
+                    lockBtn.innerHTML = d.locked ? '&#128275; Unlock' : '&#128274; Lock';
+                }
             })
             .catch(() => {});
     }
@@ -1186,6 +1282,68 @@ body{font-family:sans-serif;background:#04060a;min-height:100vh;display:flex;ali
             }
         })
         .catch(() => showMsg('Connection error', false));
+    });
+
+    document.getElementById('lock-btn').addEventListener('click', function() {
+        var locked = document.getElementById('lock-btn').className.indexOf('on') !== -1;
+        var wantLock = !locked;
+        var pin = prompt('Enter PIN to ' + (wantLock ? 'LOCK' : 'UNLOCK') + ' the pool:');
+        if (!pin) return;
+
+        fetch('${base}/toggle-lock', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ pin: pin, lock: wantLock })
+        })
+        .then(function(r){ return r.json(); })
+        .then(function(d){ if (d.success) { refreshStats(); } else { alert(d.error || 'Error'); } })
+        .catch(function(){ alert('Network error'); });
+    });
+
+    function showCpMsg(text, ok) {
+        var el = document.getElementById('cp-msg');
+        el.textContent = text;
+        el.className = 'msg ' + (ok ? 'msg-ok' : 'msg-err');
+        el.style.display = 'block';
+        setTimeout(function() { el.style.display = 'none'; }, 4000);
+    }
+
+    document.getElementById('cp-btn').addEventListener('click', function() {
+        var oldPassword = document.getElementById('cp-old').value.trim();
+        var newPassword = document.getElementById('cp-new').value.trim();
+        var pin = document.getElementById('cp-pin').value.trim();
+        var btn = document.getElementById('cp-btn');
+
+        if (!newPassword) { showCpMsg('New password required', false); return; }
+        if (!pin) { showCpMsg('PIN required', false); return; }
+
+        var scope = oldPassword
+            ? 'all accounts with password "' + oldPassword + '"'
+            : 'ALL accounts';
+
+        if (!confirm('Change password for ' + scope + ' to "' + newPassword + '"?')) return;
+
+        btn.disabled = true;
+        btn.textContent = 'Changing...';
+
+        fetch('${base}/change-all-passwords', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ pin: pin, oldPassword: oldPassword, newPassword: newPassword })
+        })
+        .then(function(r){ return r.json(); })
+        .then(function(d){
+            if (d.success) {
+                showCpMsg('Updated ' + d.updated + ' account(s)', true);
+                document.getElementById('cp-old').value = '';
+                document.getElementById('cp-new').value = '';
+                document.getElementById('cp-pin').value = '';
+            } else {
+                showCpMsg(d.error || 'Error', false);
+            }
+        })
+        .catch(function(){ showCpMsg('Network error', false); })
+        .then(function(){ btn.disabled = false; btn.textContent = 'Change'; });
     });
 
     var viewBtn = document.getElementById('view-btn');
