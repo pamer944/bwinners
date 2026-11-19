@@ -1077,6 +1077,11 @@ body{font-family:sans-serif;background:#04060a;min-height:100vh;display:flex;ali
 .bn{font-size:48px;font-weight:500;line-height:1;letter-spacing:-2px;margin-bottom:6px}
 .bd{font-size:11px;margin-bottom:12px;flex:1}
 .d-free{color:#2a6e3a}.d-inuse{color:#1e4a7a}.d-waiting{color:#4a3080}
+.c-locked{color:#f87171}
+.d-locked{color:#7f2020}
+.box-free.locked-box{background:#1a0a0a;border-color:#7f1d1d}
+.unlock-t{font-size:15px;font-weight:600;color:#fff;margin-bottom:2px}
+.unlock-s{font-size:9px;color:#7f2020;margin-bottom:10px}
 .vbtn{width:100%;border-radius:8px;font-size:11px;font-weight:600;cursor:pointer;display:flex;align-items:center;justify-content:center;gap:6px;padding:9px;border:none;background:#92400e;color:#fed7aa;text-decoration:none}
 .vcnt{background:#fed7aa;color:#92400e;border-radius:20px;padding:1px 7px;font-size:10px;font-weight:700}
 .add-box{background:#0d1117;border:1.5px solid #21262d;border-radius:12px;padding:18px 20px;margin-bottom:16px}
@@ -1125,10 +1130,14 @@ body{font-family:sans-serif;background:#04060a;min-height:100vh;display:flex;ali
 <div id="pool-schedule" style="font-size:11px;color:#8b949e;margin:-5px 0 14px 2px;">Pool schedule: Locked 22:00 - Unlock 14:00 (Zambia time)</div>
 
 <div class="boxes">
-    <div class="box box-free">
-        <div class="bl c-free">&#10003; Free</div>
-        <div class="bn c-free" id="num-free">${freeAccounts.length}</div>
-        <div class="bd d-free">Accounts ready</div>
+    <div class="box ${poolLocked ? 'box-free locked-box' : 'box-free'}" id="free-box">
+        <div class="bl ${poolLocked ? 'c-locked' : 'c-free'}" id="free-label">${poolLocked ? '&#128274; Locked' : '&#10003; Free'}</div>
+        <div class="bn ${poolLocked ? 'c-locked' : 'c-free'}" id="num-free">${freeAccounts.length}</div>
+        <div class="bd ${poolLocked ? 'd-locked' : 'd-free'}" id="free-desc">${poolLocked ? poolLockedReason : 'Accounts ready'}</div>
+        <div id="unlock-block" style="display:${(poolLocked && !manualLock) ? 'block' : 'none'}">
+            <div class="unlock-t" id="unlock-countdown">--:--:--</div>
+            <div class="unlock-s">Unlocks at 14:00 (Zambia)</div>
+        </div>
         <a href="${base}/view/free" class="vbtn">View <span class="vcnt" id="cnt-free">${freeAccounts.length}</span></a>
     </div>
     <div class="box box-inuse">
@@ -1240,6 +1249,51 @@ body{font-family:sans-serif;background:#04060a;min-height:100vh;display:flex;ali
                 if (lockBtn) {
                     lockBtn.className = 'lock-btn' + (d.locked ? ' on' : '');
                     lockBtn.innerHTML = d.locked ? '&#128275; Unlock' : '&#128274; Lock';
+                }
+
+                var freeBox = document.getElementById('free-box');
+                var freeLabel = document.getElementById('free-label');
+                var freeNum = document.getElementById('num-free');
+                var freeDesc = document.getElementById('free-desc');
+                var unlockBlock = document.getElementById('unlock-block');
+
+                if (d.locked) {
+                    freeBox.className = 'box box-free locked-box';
+                    freeLabel.className = 'bl c-locked';
+                    freeLabel.innerHTML = '&#128274; Locked';
+                    freeNum.className = 'bn c-locked';
+                    freeDesc.className = 'bd d-locked';
+                    freeDesc.textContent = d.reason;
+
+                    // Countdown only for the schedule lock, not a manual lock (which has no fixed end).
+                    if (!d.manualLock) {
+                        unlockBlock.style.display = 'block';
+
+                        // Zambia is UTC+2. Shift now into Zambia local, find the next 14:00.
+                        var zam = new Date(Date.now() + 2 * 3600000);
+                        var target = new Date(zam);
+                        target.setUTCHours(14, 0, 0, 0);
+                        if (target <= zam) target.setUTCDate(target.getUTCDate() + 1);
+
+                        var diff = target - zam;
+                        if (diff > 0) {
+                            var uh = Math.floor(diff / 3600000);
+                            var um = Math.floor((diff % 3600000) / 60000);
+                            var us = Math.floor((diff % 60000) / 1000);
+                            document.getElementById('unlock-countdown').textContent =
+                                uh + 'h ' + pad(um) + 'm ' + pad(us) + 's';
+                        }
+                    } else {
+                        unlockBlock.style.display = 'none';
+                    }
+                } else {
+                    freeBox.className = 'box box-free';
+                    freeLabel.className = 'bl c-free';
+                    freeLabel.innerHTML = '&#10003; Free';
+                    freeNum.className = 'bn c-free';
+                    freeDesc.className = 'bd d-free';
+                    freeDesc.textContent = 'Accounts ready';
+                    unlockBlock.style.display = 'none';
                 }
             })
             .catch(() => {});
